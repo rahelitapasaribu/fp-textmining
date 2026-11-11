@@ -300,71 +300,303 @@ def classify(texts: list[str]) -> pd.DataFrame:
     })
 
 # ----------------------------------------------------------------------------
-# Database (SQLite)
+# Database (SQLite) - ERD 4 Entitas
 # ----------------------------------------------------------------------------
+
 def get_conn():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 
 def init_db():
     with get_conn() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS batch (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                waktu TEXT NOT NULL,
-                jenis_input TEXT NOT NULL,      -- 'Teks' / 'CSV'
+
+        # Membuat tabel INPUT, TWEET, LABEL, dan DETEKSI
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS input_data (
+                id_input INTEGER PRIMARY KEY AUTOINCREMENT,
+                jenis_input TEXT NOT NULL,
                 nama_file TEXT,
-                jumlah_data INTEGER NOT NULL
+                waktu_input TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS hasil (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                batch_id INTEGER NOT NULL,
-                tweet TEXT NOT NULL,
-                label TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                FOREIGN KEY (batch_id) REFERENCES batch(id)
+
+            CREATE TABLE IF NOT EXISTS tweet (
+                id_tweet INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_input INTEGER NOT NULL,
+                isi_tweet TEXT NOT NULL,
+                FOREIGN KEY (id_input)
+                    REFERENCES input_data(id_input)
+                    ON DELETE CASCADE
             );
-            """
-        )
+
+            CREATE TABLE IF NOT EXISTS label (
+                id_label INTEGER PRIMARY KEY AUTOINCREMENT,
+                nama_label TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS deteksi (
+                id_deteksi INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_tweet INTEGER NOT NULL UNIQUE,
+                id_label INTEGER NOT NULL,
+                waktu_deteksi TEXT NOT NULL,
+                confidence_score REAL NOT NULL,
+                FOREIGN KEY (id_tweet)
+                    REFERENCES tweet(id_tweet)
+                    ON DELETE CASCADE,
+                FOREIGN KEY (id_label)
+                    REFERENCES label(id_label)
+            );
+
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                migration_name TEXT PRIMARY KEY
+            );
+        """)
+
+        # Memasukkan dua label klasifikasi
+        conn.execute("""
+            INSERT OR IGNORE INTO label (nama_label)
+            VALUES ('Non-Hate Speech')
+        """)
+
+        conn.execute("""
+            INSERT OR IGNORE INTO label (nama_label)
+            VALUES ('Hate Speech')
+        """)
+
+        # ----------------------------------------------------
+        # Migrasi data dari tabel lama (batch dan hasil)
+        # ----------------------------------------------------
+
+        migration_name = "migrate_batch_hasil_to_erd_4_tables"
+
+        migration_done = conn.execute("""
+            SELECT migration_name
+            FROM schema_migrations
+            WHERE migration_name = ?
+        """, (migration_name,)).fetchone()
+
+        if migration_done is None:
+
+            # Memeriksa apakah tabel lama tersedia
+            old_tables = conn.execute("""
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name IN ('batch', 'hasil')
+            """).fetchall()
+
+            old_table_names = [row[0] for row in old_tables]
+
+            if "batch" in old_table_names and "hasil" in old_table_names:
+
+                old_batches = conn.execute("""
+                    SELECT id, waktu, jenis_input, nama_file
+                    FROM batch
+                    ORDER BY id
+                """).fetchall()
+
+                for batch in old_batches:
+                    old_batch_id, waktu, jenis_input, nama_file = batch
+
+                    # Memindahkan data batch menjadi INPUT
+                    cur = conn.execute("""
+                        INSERT INTO input_data (
+                            jenis_input,
+                            nama_file,
+                            waktu_input
+                        )
+                        VALUES (?, ?, ?)
+                    """, (jenis_input, nama_file, waktu))
+
+                    new_input_id = cur.lastrowid
+
+                    # Mengambil hasil klasifikasi dari batch lama
+                    old_results = conn.execute("""
+                        SELECT tweet, label, confidence
+                        FROM hasil
+                        WHERE batch_id = ?
+                    """, (old_batch_id,)).fetchall()
+
+                    for tweet_text, nama_label, confidence in old_results:
+
+                        # Memastikan label tersedia
+                        label_row = conn.execute("""
+                            SELECT id_label
+                            FROM label
+                            WHERE nama_label = ?
+                        """, (nama_label,)).fetchone()
+
+                        # Jika label lama berbeda dari dua label utama,
+                        # tambahkan agar data lama tetap dapat dimigrasikan.
+                        if label_row is None:
+                            conn.execute("""
+                                INSERT OR IGNORE INTO label (nama_label)
+                                VALUES (?)
+                            """, (nama_label,))
+
+                            label_row = conn.execute("""
+                                SELECT id_label
+                                FROM label
+                                WHERE nama_label = ?
+                            """, (nama_label,)).fetchone()
+
+                        new_label_id = label_row[0]
+
+                        # Memindahkan data tweet
+                        cur_tweet = conn.execute("""
+                            INSERT INTO tweet (id_input, isi_tweet)
+                            VALUES (?, ?)
+                        """, (new_input_id, tweet_text))
+
+                        new_tweet_id = cur_tweet.lastrowid
+
+                        # Memindahkan data deteksi
+                        conn.execute("""
+                            INSERT INTO deteksi (
+                                id_tweet,
+                                id_label,
+                                waktu_deteksi,
+                                confidence_score
+                            )
+                            VALUES (?, ?, ?, ?)
+                        """, (
+                            new_tweet_id,
+                            new_label_id,
+                            waktu,
+                            confidence
+                        ))
+
+            # Menandai migrasi sudah dilakukan
+            conn.execute("""
+                INSERT INTO schema_migrations (migration_name)
+                VALUES (?)
+            """, (migration_name,))
 
 
-def save_history(df: pd.DataFrame, jenis_input: str, nama_file: str | None = None) -> int:
+def save_history(
+    df: pd.DataFrame,
+    jenis_input: str,
+    nama_file: str | None = None
+) -> int:
+
     with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO batch (waktu, jenis_input, nama_file, jumlah_data) VALUES (?, ?, ?, ?)",
-            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), jenis_input, nama_file, len(df)),
-        )
-        batch_id = cur.lastrowid
-        conn.executemany(
-            "INSERT INTO hasil (batch_id, tweet, label, confidence) VALUES (?, ?, ?, ?)",
-            [(batch_id, r.tweet, r.label, float(r.confidence)) for r in df.itertuples()],
-        )
-    return batch_id
+
+        waktu_input = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 1. Menyimpan data INPUT
+        cur = conn.execute("""
+            INSERT INTO input_data (
+                jenis_input,
+                nama_file,
+                waktu_input
+            )
+            VALUES (?, ?, ?)
+        """, (
+            jenis_input,
+            nama_file,
+            waktu_input
+        ))
+
+        input_id = cur.lastrowid
+
+        # 2. Menyimpan setiap TWEET dan DETEKSI
+        for row in df.itertuples(index=False):
+
+            # Mengambil ID label berdasarkan hasil klasifikasi
+            label_row = conn.execute("""
+                SELECT id_label
+                FROM label
+                WHERE nama_label = ?
+            """, (row.label,)).fetchone()
+
+            if label_row is None:
+                raise ValueError(f"Label tidak ditemukan: {row.label}")
+
+            label_id = label_row[0]
+
+            # Menyimpan tweet
+            cur_tweet = conn.execute("""
+                INSERT INTO tweet (
+                    id_input,
+                    isi_tweet
+                )
+                VALUES (?, ?)
+            """, (
+                input_id,
+                str(row.tweet)
+            ))
+
+            tweet_id = cur_tweet.lastrowid
+
+            # Menyimpan hasil deteksi
+            waktu_deteksi = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            conn.execute("""
+                INSERT INTO deteksi (
+                    id_tweet,
+                    id_label,
+                    waktu_deteksi,
+                    confidence_score
+                )
+                VALUES (?, ?, ?, ?)
+            """, (
+                tweet_id,
+                label_id,
+                waktu_deteksi,
+                float(row.confidence)
+            ))
+
+    return input_id
 
 
 def load_batches() -> pd.DataFrame:
+
     with get_conn() as conn:
-        return pd.read_sql_query(
-            "SELECT id, waktu, jenis_input, nama_file, jumlah_data FROM batch ORDER BY id DESC",
-            conn,
-        )
+        return pd.read_sql_query("""
+            SELECT
+                i.id_input AS id,
+                i.waktu_input AS waktu,
+                i.jenis_input,
+                i.nama_file,
+                COUNT(t.id_tweet) AS jumlah_data
+            FROM input_data i
+            LEFT JOIN tweet t
+                ON i.id_input = t.id_input
+            GROUP BY
+                i.id_input,
+                i.waktu_input,
+                i.jenis_input,
+                i.nama_file
+            ORDER BY i.id_input DESC
+        """, conn)
 
 
 def load_batch_detail(batch_id: int) -> pd.DataFrame:
+
     with get_conn() as conn:
-        return pd.read_sql_query(
-            "SELECT tweet, label, confidence FROM hasil WHERE batch_id = ?",
-            conn,
-            params=(batch_id,),
-        )
+        return pd.read_sql_query("""
+            SELECT
+                t.isi_tweet AS tweet,
+                l.nama_label AS label,
+                d.confidence_score AS confidence
+            FROM tweet t
+            JOIN deteksi d
+                ON t.id_tweet = d.id_tweet
+            JOIN label l
+                ON d.id_label = l.id_label
+            WHERE t.id_input = ?
+            ORDER BY t.id_tweet
+        """, conn, params=(batch_id,))
 
 
 def delete_batch(batch_id: int):
-    with get_conn() as conn:
-        conn.execute("DELETE FROM hasil WHERE batch_id = ?", (batch_id,))
-        conn.execute("DELETE FROM batch WHERE id = ?", (batch_id,))
 
+    with get_conn() as conn:
+        conn.execute("""
+            DELETE FROM input_data
+            WHERE id_input = ?
+        """, (batch_id,))
 
 # ----------------------------------------------------------------------------
 # Komponen UI

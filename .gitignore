@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+.env.*
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
